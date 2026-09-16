@@ -20,7 +20,7 @@ const CGS_TIMEOUT_MS = 7000;
 const KRUNKER_GAME_LIST = "https://matchmaker.krunker.io/game-list?hostname=krunker.io";
 
 // Set this to your own proxy (see worker.js) and it gets tried first.
-var custom_proxy = "";
+var custom_proxy = "https://krunkerservers.knlvx-aura.workers.dev";
 
 const cgs_sources = [
     {
