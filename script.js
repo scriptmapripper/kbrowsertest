@@ -1,51 +1,125 @@
 var cgs_global;  // global source of truth for cgs
 var update_cgs = true;  // whether to fetch cgs next time
-var cgs_server = "https://krunk.infinitifall.net/scripts/custom-games.json";
 var show_pubs = false;  // whether to show public lobbies
 
 var latest_mode_type = null;
 var latest_regions_group = null;
 
+var last_cgs_error = null;   // human-readable reason the last fetch failed, for debugging
+var active_source = null;    // index of the source that worked last time
 
-var last_cgs_error = null;  // human-readable reason the last fetch failed, for debugging
+// The original upstream (krunk.infinitifall.net) was just a mirror of Krunker's
+// own matchmaker endpoint. The mirror is dead, so we read the matchmaker
+// directly. Krunker doesn't always send CORS headers, so if the direct call is
+// blocked we fall through a list of public CORS proxies.
+const KRUNKER_GAME_LIST = "https://matchmaker.krunker.io/game-list?hostname=krunker.io";
+
+const cgs_sources = [
+    {
+        name: "krunker matchmaker (direct)",
+        url: function () { return KRUNKER_GAME_LIST + "&_=" + Date.now(); },
+        parse: async function (response) { return await response.json(); }
+    },
+    {
+        name: "corsproxy.io",
+        url: function () {
+            return "https://corsproxy.io/?" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+        },
+        parse: async function (response) { return await response.json(); }
+    },
+    {
+        name: "allorigins",
+        url: function () {
+            return "https://api.allorigins.win/get?url=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+        },
+        parse: async function (response) {
+            let wrapped = await response.json();
+            return JSON.parse(wrapped.contents);
+        }
+    },
+    {
+        name: "codetabs",
+        url: function () {
+            return "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+        },
+        parse: async function (response) { return await response.json(); }
+    }
+];
 
 /**
- * Update cgs_global by fetching cgs from server
+ * Accept either {"games": [...]} or a bare array, always return {"games": [...]}
+ *
+ * @param {Object} data Raw parsed payload
+ */
+function normalize_cgs(data) {
+    if (data && Array.isArray(data.games)) { return data; }
+    if (Array.isArray(data)) { return { games: data }; }
+    return null;
+}
+
+/**
+ * Try one source once, return normalized data or null
+ *
+ * @param {Object} source An entry of cgs_sources
+ */
+async function try_cgs_source(source) {
+    let response;
+    try {
+        response = await fetch(source.url(), { cache: "no-store" });
+    } catch (e) {
+        last_cgs_error = source.name + ": network/CORS error (" + e.message + ")";
+        return null;
+    }
+
+    if (response.status != 200) {
+        last_cgs_error = source.name + ": HTTP " + response.status;
+        return null;
+    }
+
+    let data;
+    try {
+        data = await source.parse(response);
+    } catch (e) {
+        last_cgs_error = source.name + ": bad JSON (" + e.message + ")";
+        return null;
+    }
+
+    data = normalize_cgs(data);
+    if (data == null || data.games.length == 0) {
+        last_cgs_error = source.name + ": responded, but the lobby list was empty";
+        return null;
+    }
+
+    return data;
+}
+
+/**
+ * Update cgs_global by fetching cgs from the first source that works
  */
 async function update_cgs_global() {
-    // fetch cgs from server
-    let response;
-    let status;
-    let remaining_tries = 3;
-    for (let i = 0; i < remaining_tries; i++) {
-        try {
-            response = await fetch(cgs_server);
-        } catch (e) {
-            // network-level failure: DNS down, server unreachable, CORS block, mixed content, etc.
-            last_cgs_error = "Network error reaching " + cgs_server + ": " + e.message;
-            console.error(last_cgs_error);
-            return null;
+    // start from whichever source worked last time, then wrap around
+    let order = new Array();
+    for (let i = 0; i < cgs_sources.length; i++) {
+        order.push(((active_source == null ? 0 : active_source) + i) % cgs_sources.length);
+    }
+
+    let errors = new Array();
+    for (let i = 0; i < order.length; i++) {
+        let data = await try_cgs_source(cgs_sources[order[i]]);
+        if (data != null) {
+            cgs_global = data;
+            active_source = order[i];
+            last_cgs_error = null;
+            return 200;
         }
-        status = response.status;
-        if (status == 200) { break; }
+        console.warn(last_cgs_error);
+        errors.push(last_cgs_error);
     }
 
-    if (status != 200) {
-        last_cgs_error = "Server responded with HTTP " + status + " from " + cgs_server;
-        console.error(last_cgs_error);
-        return null;
-    }
-
-    // update cgs_global
-    try {
-        cgs_global = await response.json();
-    } catch (e) {
-        last_cgs_error = "Response wasn't valid JSON from " + cgs_server + ": " + e.message;
-        console.error(last_cgs_error);
-        return null;
-    }
-    last_cgs_error = null;
-    return status;
+    active_source = null;
+    last_cgs_error = "All sources failed — " + errors.join(" | ");
+    console.error(last_cgs_error);
+    return null;
 }
 
 /**
@@ -338,7 +412,8 @@ function polished_cgs(cgs, mode_type, regions_group) {
         "BRZ":  ["Brazil",      6,      5],
         "MX":   ["Mexico",      7,      2],
         "AFR":  ["Africa",      8,      2],
-        "BHN":  ["Arabia",      9,      5]
+        "BHN":  ["Arabia",      9,      5],
+        "SSS":  ["Asia",        3,      4]
     };
 
     //  regions_group / preference (used for ordering)
@@ -633,6 +708,9 @@ async function populate_wrapper(mode_type, regions_group) {
                 table.appendChild(document.createElement("br"));
                 table.appendChild(error_detail);
             }
+
+            // nothing to render, don't fall through into polished_cgs(undefined)
+            if (cgs_global == null) { return; }
         }
     }
 
