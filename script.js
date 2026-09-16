@@ -8,11 +8,19 @@ var latest_regions_group = null;
 var last_cgs_error = null;   // human-readable reason the last fetch failed, for debugging
 var active_source = null;    // index of the source that worked last time
 
+// How long to wait on one source before giving up and trying the next one.
+// Without this, a proxy that accepts the connection but never answers leaves
+// the page stuck on "Loading..." forever.
+const CGS_TIMEOUT_MS = 7000;
+
 // The original upstream (krunk.infinitifall.net) was just a mirror of Krunker's
 // own matchmaker endpoint. The mirror is dead, so we read the matchmaker
 // directly. Krunker doesn't always send CORS headers, so if the direct call is
 // blocked we fall through a list of public CORS proxies.
 const KRUNKER_GAME_LIST = "https://matchmaker.krunker.io/game-list?hostname=krunker.io";
+
+// Set this to your own proxy (see worker.js) and it gets tried first.
+var custom_proxy = "";
 
 const cgs_sources = [
     {
@@ -21,21 +29,11 @@ const cgs_sources = [
         parse: async function (response) { return await response.json(); }
     },
     {
-        name: "corsproxy.io",
+        name: "allorigins (raw)",
         url: function () {
-            return "https://corsproxy.io/?" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+            return "https://api.allorigins.win/raw?url=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
         },
         parse: async function (response) { return await response.json(); }
-    },
-    {
-        name: "allorigins",
-        url: function () {
-            return "https://api.allorigins.win/get?url=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
-        },
-        parse: async function (response) {
-            let wrapped = await response.json();
-            return JSON.parse(wrapped.contents);
-        }
     },
     {
         name: "codetabs",
@@ -43,8 +41,43 @@ const cgs_sources = [
             return "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
         },
         parse: async function (response) { return await response.json(); }
+    },
+    {
+        name: "corsproxy.io",
+        url: function () {
+            return "https://corsproxy.io/?url=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+        },
+        parse: async function (response) { return await response.json(); }
+    },
+    {
+        name: "allorigins (wrapped)",
+        url: function () {
+            return "https://api.allorigins.win/get?url=" + encodeURIComponent(KRUNKER_GAME_LIST + "&_=" + Date.now());
+        },
+        parse: async function (response) {
+            let wrapped = await response.json();
+            return JSON.parse(wrapped.contents);
+        }
     }
 ];
+
+if (custom_proxy != "") {
+    cgs_sources.unshift({
+        name: "custom proxy",
+        url: function () { return custom_proxy + (custom_proxy.indexOf("?") == -1 ? "?" : "&") + "_=" + Date.now(); },
+        parse: async function (response) { return await response.json(); }
+    });
+}
+
+/**
+ * Write a one-line status into the table area, so a slow fetch is visible
+ *
+ * @param {String} text Message to show
+ */
+function set_loading_status(text) {
+    let table = document.getElementById("cgs");
+    if (table != null) { table.innerHTML = text; }
+}
 
 /**
  * Accept either {"games": [...]} or a bare array, always return {"games": [...]}
@@ -64,12 +97,21 @@ function normalize_cgs(data) {
  */
 async function try_cgs_source(source) {
     let response;
+    let controller = new AbortController();
+    let timer = setTimeout(function () { controller.abort(); }, CGS_TIMEOUT_MS);
+
     try {
-        response = await fetch(source.url(), { cache: "no-store" });
+        response = await fetch(source.url(), { cache: "no-store", signal: controller.signal });
     } catch (e) {
-        last_cgs_error = source.name + ": network/CORS error (" + e.message + ")";
+        clearTimeout(timer);
+        if (e.name == "AbortError") {
+            last_cgs_error = source.name + ": timed out after " + (CGS_TIMEOUT_MS / 1000) + "s";
+        } else {
+            last_cgs_error = source.name + ": network/CORS error (" + e.message + ")";
+        }
         return null;
     }
+    clearTimeout(timer);
 
     if (response.status != 200) {
         last_cgs_error = source.name + ": HTTP " + response.status;
@@ -105,14 +147,18 @@ async function update_cgs_global() {
 
     let errors = new Array();
     for (let i = 0; i < order.length; i++) {
-        let data = await try_cgs_source(cgs_sources[order[i]]);
+        let source = cgs_sources[order[i]];
+        set_loading_status("Loading... (" + (i + 1) + "/" + order.length + ": " + source.name + ")");
+
+        let data = await try_cgs_source(source);
         if (data != null) {
             cgs_global = data;
             active_source = order[i];
             last_cgs_error = null;
+            console.log("KBrowser: " + data.games.length + " lobbies from " + source.name);
             return 200;
         }
-        console.warn(last_cgs_error);
+        console.warn("KBrowser: " + last_cgs_error);
         errors.push(last_cgs_error);
     }
 
